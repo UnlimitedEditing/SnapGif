@@ -11,11 +11,13 @@ from datetime import datetime
 try:
     from PIL import Image
     import mss
+    import keyboard
 except ImportError:
     import subprocess
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow", "mss"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow", "mss", "keyboard"])
     from PIL import Image
     import mss
+    import keyboard
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
@@ -77,6 +79,107 @@ class Settings:
         self.max_duration = 30
         self.output_dir   = os.path.expanduser("~/Desktop")
         self.loop_gif     = 0
+        self.hotkey       = "f3"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Region marker  (subtle border shown over the capture area during recording)
+# ─────────────────────────────────────────────────────────────────────────────
+class RegionMarker:
+    """
+    A click-through borderless window that draws a glowing dashed border
+    around the capture region while recording is active.
+    Uses WS_EX_TRANSPARENT so all mouse events fall through to windows below.
+    """
+    CORNER_LEN  = 18      # px length of each corner bracket arm
+    LINE_W      = 2
+    COLOR_A     = "#00ff88"
+    COLOR_B     = "#007744"
+    PULSE_MS    = 700
+    PADDING     = 3       # px outside the actual region
+
+    def __init__(self, parent: tk.Tk, x1: int, y1: int, x2: int, y2: int):
+        pad = self.PADDING
+        wx, wy = x1 - pad, y1 - pad
+        ww, wh = (x2 - x1) + pad * 2, (y2 - y1) + pad * 2
+
+        win = tk.Toplevel(parent)
+        win.overrideredirect(True)
+        win.geometry(f"{ww}x{wh}+{wx}+{wy}")
+        win.attributes("-topmost", True)
+        win.attributes("-transparentcolor", "#010101")   # unique bg → transparent
+        win.configure(bg="#010101")
+        win.wm_attributes("-alpha", 1.0)
+        self._win = win
+
+        # Make the window click-through via WS_EX_TRANSPARENT
+        try:
+            win.update_idletasks()
+            GWL_EXSTYLE      = -20
+            WS_EX_LAYERED    = 0x00080000
+            WS_EX_TRANSPARENT = 0x00000020
+            hwnd = ctypes.windll.user32.GetAncestor(win.winfo_id(), 2)
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ctypes.windll.user32.SetWindowLongW(
+                hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT
+            )
+        except Exception:
+            pass
+
+        cv = tk.Canvas(win, width=ww, height=wh, bg="#010101",
+                       highlightthickness=0)
+        cv.pack()
+        self._cv    = cv
+        self._ww    = ww
+        self._wh    = wh
+        self._phase = True
+        self._job   = None
+        self._draw(self.COLOR_A)
+        self._pulse()
+
+    def _draw(self, color: str):
+        cv = self._cv
+        cv.delete("all")
+        W, H = self._ww, self._wh
+        CL   = self.CORNER_LEN
+        LW   = self.LINE_W
+
+        # Dashed border
+        cv.create_rectangle(LW, LW, W - LW, H - LW,
+                             outline=color, width=LW,
+                             dash=(6, 5))
+
+        # Corner brackets (solid, brighter than the dashes)
+        bright = self.COLOR_A
+        segs = [
+            # top-left
+            (LW, LW, LW + CL, LW), (LW, LW, LW, LW + CL),
+            # top-right
+            (W - LW - CL, LW, W - LW, LW), (W - LW, LW, W - LW, LW + CL),
+            # bottom-left
+            (LW, H - LW - CL, LW, H - LW), (LW, H - LW, LW + CL, H - LW),
+            # bottom-right
+            (W - LW, H - LW - CL, W - LW, H - LW),
+            (W - LW - CL, H - LW, W - LW, H - LW),
+        ]
+        for x0, y0, x1, y1 in segs:
+            cv.create_line(x0, y0, x1, y1, fill=bright, width=LW + 1)
+
+    def _pulse(self):
+        self._phase = not self._phase
+        self._draw(self.COLOR_A if self._phase else self.COLOR_B)
+        self._job = self._win.after(self.PULSE_MS, self._pulse)
+
+    def destroy(self):
+        if self._job:
+            try:
+                self._win.after_cancel(self._job)
+            except Exception:
+                pass
+        try:
+            self._win.destroy()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -176,7 +279,7 @@ class SettingsDialog:
 
         win = tk.Toplevel(parent)
         win.title("SnapGIF  —  Settings")
-        win.geometry("360x295")
+        win.geometry("360x370")
         win.resizable(False, False)
         win.attributes("-topmost", True)
         win.configure(bg=BG)
@@ -184,7 +287,7 @@ class SettingsDialog:
         self._win = win
         win.update_idletasks()
         sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
-        win.geometry(f"360x295+{(sw-360)//2}+{(sh-295)//2}")
+        win.geometry(f"360x370+{(sw-360)//2}+{(sh-370)//2}")
 
         def hdg(text):
             tk.Label(win, text=text, bg=BG, fg="#9090b0",
@@ -230,6 +333,18 @@ class SettingsDialog:
             font=("Segoe UI", 9, "bold"), cursor="hand2").pack(
             side="left", padx=(4, 0))
 
+        # Hotkey
+        hdg("Record / Stop hotkey:")
+        hk_row = tk.Frame(win, bg=BG)
+        hk_row.pack(fill="x", padx=24)
+        self._hotkey = tk.StringVar(value=settings.hotkey)
+        hk_entry = tk.Entry(hk_row, textvariable=self._hotkey,
+            bg=DARK, fg="#00ff88", insertbackground="white",
+            relief="flat", font=("Courier New", 11, "bold"), bd=4, width=10)
+        hk_entry.pack(side="left")
+        tk.Label(hk_row, text="  e.g.  f3  /  f9  /  ctrl+shift+r",
+            bg=BG, fg="#555570", font=("Segoe UI", 8)).pack(side="left")
+
         tk.Button(win, text="  Save Settings  ", command=self._save,
             bg="#e94560", fg="white", relief="flat",
             font=("Segoe UI", 10, "bold"), pady=8, cursor="hand2").pack(pady=14)
@@ -243,7 +358,11 @@ class SettingsDialog:
         self._s.fps          = self._fps.get()
         self._s.max_duration = self._dur.get()
         self._s.output_dir   = self._dir.get()
+        self._s.hotkey       = self._hotkey.get().strip().lower()
         self._win.destroy()
+        # Notify app to rebind hotkey (app sets this callback before opening dialog)
+        if callable(getattr(self._s, "_on_hotkey_changed", None)):
+            self._s._on_hotkey_changed()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -263,6 +382,11 @@ class SnapGIF:
         self._frames    = []
         self._region    = None
         self._blink_id  = None
+        self._marker: RegionMarker | None = None
+        self._hotkey_bound: str | None = None
+
+        # Let settings dialog trigger rebind after save
+        self._settings._on_hotkey_changed = self._rebind_hotkey
 
         root = tk.Tk()
         root.title("SnapGIF")
@@ -274,6 +398,7 @@ class SnapGIF:
         root.geometry(f"232x44+{sw - 248}+18")
         self._root = root
         self._build_ui()
+        self._rebind_hotkey()
 
     # ── UI ────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -298,14 +423,14 @@ class SnapGIF:
             bg=self.BTN_REC, fg=self.FG_BRIGHT, padx=9,
             command=self._start_selection, **B)
         self._rec_btn.pack(side="left", padx=(0, 3))
-        Tooltip(self._rec_btn, "Select region and start recording")
+        Tooltip(self._rec_btn, "Select region and start recording  (or press hotkey)")
 
         # STOP button
         self._stop_btn = tk.Button(row, text="⏹  STOP",
             bg=self.BTN_DARK, fg=self.FG_DIM, padx=6,
             command=self._stop_recording, state="disabled", **B)
         self._stop_btn.pack(side="left", padx=(0, 3))
-        Tooltip(self._stop_btn, "Stop recording and save GIF")
+        Tooltip(self._stop_btn, "Stop recording and save GIF  (or press hotkey)")
 
         # Gear (canvas-drawn so it always renders correctly)
         gear = tk.Canvas(row, width=24, height=24, bg=self.BG,
@@ -370,6 +495,8 @@ class SnapGIF:
         self._frames    = []
         self._rec_btn.config(state="disabled", bg="#2a2a44", fg=self.FG_DIM)
         self._stop_btn.config(state="normal",  bg=self.BTN_REC, fg=self.FG_BRIGHT)
+        # Show the region marker overlay
+        self._show_marker()
         self._blink()
         threading.Thread(target=self._capture_loop, daemon=True).start()
 
@@ -406,6 +533,7 @@ class SnapGIF:
         if not self._recording:
             return
         self._recording = False
+        self._hide_marker()
         if self._blink_id:
             self._root.after_cancel(self._blink_id)
             self._blink_id = None
@@ -450,12 +578,58 @@ class SnapGIF:
             parent=self._root):
             os.startfile(os.path.dirname(path))
 
+    # ── Region marker ─────────────────────────────────────────────────────
+    def _show_marker(self):
+        self._hide_marker()
+        if self._region:
+            x1, y1, x2, y2 = self._region
+            self._marker = RegionMarker(self._root, x1, y1, x2, y2)
+
+    def _hide_marker(self):
+        if self._marker:
+            self._marker.destroy()
+            self._marker = None
+
+    # ── Hotkey ────────────────────────────────────────────────────────────
+    def _rebind_hotkey(self):
+        """Unbind old hotkey (if any) and bind the current one."""
+        if self._hotkey_bound:
+            try:
+                keyboard.remove_hotkey(self._hotkey_bound)
+            except Exception:
+                pass
+            self._hotkey_bound = None
+        key = self._settings.hotkey.strip()
+        if key:
+            try:
+                keyboard.add_hotkey(key, self._hotkey_pressed, suppress=False)
+                self._hotkey_bound = key
+            except Exception as e:
+                print(f"[SnapGIF] Could not bind hotkey '{key}': {e}")
+
+    def _hotkey_pressed(self):
+        """Called from keyboard thread — schedule on tk main thread."""
+        self._root.after(0, self._toggle_record)
+
+    def _toggle_record(self):
+        if self._recording:
+            self._stop_recording()
+        else:
+            self._start_selection()
+
     # ── Settings ──────────────────────────────────────────────────────────
     def _open_settings(self):
         SettingsDialog(self._root, self._settings)
 
     def run(self):
-        self._root.mainloop()
+        try:
+            self._root.mainloop()
+        finally:
+            if self._hotkey_bound:
+                try:
+                    keyboard.remove_hotkey(self._hotkey_bound)
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
